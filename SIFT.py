@@ -35,7 +35,6 @@ def octave(x, s):
     return torch.stack(ret, dim = 0)
 
 
-test = image_to_tensor(Image.open(r"F:\Coding\3D Recon\data\dronesplat\Simingsham\2411006_18_001.jpg").convert("L"))
 #o = # of octaves
 def create_octaves(x, s, o):
     octaves = []
@@ -47,25 +46,24 @@ def create_octaves(x, s, o):
         x = oct[s][:, ::2, ::2]
     return octaves
 
-p = create_octaves(test, 3, 4)
 def GetDoG(octaves):
     DoGs = []
-    s = octaves[0].shape[0]
+    n_levels = octaves[0].shape[0]
     for i in octaves:
         tcat = []
-        for j in range(s - 1):
+        for j in range(n_levels - 1):
             diff = i[j + 1] - i[j]
             tcat.append(diff)
         DoGs.append(torch.stack(tcat, dim = 0))
     return DoGs
 
-h = GetDoG(p)
-for i in h:
-    print(i.shape)
+
 #26 point search
-def ExtremaSearch(DoGs, contrast_threshold = 0.03):
+#s must match the value passed to create_octaves - it sets the geometric
+#spacing k = 2^(1/s) that turns a DoG index back into a sigma
+def ExtremaSearch(DoGs, s, contrast_threshold = 0.03):
     extrema = []
-    for dog in DoGs:
+    for octave_idx, dog in enumerate(DoGs):
         x = dog.squeeze(1).unsqueeze(0).unsqueeze(0)
 
         maxima = torch.nn.functional.max_pool3d(x, 3, stride = 1, padding = 1)
@@ -76,6 +74,7 @@ def ExtremaSearch(DoGs, contrast_threshold = 0.03):
         is_max = (x == maxima) & strong
         is_min = (x == minima) & strong
 
+
         keep = (is_max | is_min).squeeze(0).squeeze(0)
         #a 3x3x3 cube needs a full set of neighbours, so drop the borders
         keep[0] = False
@@ -85,10 +84,13 @@ def ExtremaSearch(DoGs, contrast_threshold = 0.03):
         keep[:, :, :1] = False
         keep[:, :, -1:] = False
 
-        s, y, xc = keep.nonzero(as_tuple = True)
-        extrema.append(torch.stack([s, y, xc], dim = 1))
+        s_idx, y, xc = keep.nonzero(as_tuple = True)
+
+        #DoG j is blur[j + 1] - blur[j], so it takes the scale of the lower
+        #blur: SIGMA * k^j. The 2^octave_idx factor undoes the subsampling so
+        #sigma comes out in original-image pixels.
+        sigma = SIGMA * (2.0 ** (s_idx.float() / s)) * (2.0 ** octave_idx)
+
+        extrema.append(torch.stack([s_idx.float(), y.float(), xc.float(), sigma], dim = 1))
     return extrema
 
-e = ExtremaSearch(h)
-for i in e:
-    print(i.shape)
