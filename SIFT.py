@@ -61,18 +61,18 @@ def GetDoG(octaves):
 #26 point search
 #s must match the value passed to create_octaves - it sets the geometric
 #spacing k = 2^(1/s) that turns a DoG index back into a sigma
-def ExtremaSearch(DoGs, s, contrast_threshold = 0.03):
+def ExtremaSearch(DoGs, sig, contrast_threshold = 0.03):
     extrema = []
     for octave_idx, dog in enumerate(DoGs):
-        x = dog.squeeze(1).unsqueeze(0).unsqueeze(0)
+        img_t = dog.squeeze(1).unsqueeze(0).unsqueeze(0)
 
-        maxima = torch.nn.functional.max_pool3d(x, 3, stride = 1, padding = 1)
-        minima = -torch.nn.functional.max_pool3d(-x, 3, stride = 1, padding = 1)
+        maxima = torch.nn.functional.max_pool3d(img_t, 3, stride = 1, padding = 1)
+        minima = -torch.nn.functional.max_pool3d(-img_t, 3, stride = 1, padding = 1)
 
         #threshold on magnitude: a dark blob is a large-magnitude minimum
-        strong = x.abs() > contrast_threshold
-        is_max = (x == maxima) & strong
-        is_min = (x == minima) & strong
+        strong = img_t.abs() > contrast_threshold
+        is_max = (img_t == maxima) & strong
+        is_min = (img_t == minima) & strong
 
 
         keep = (is_max | is_min).squeeze(0).squeeze(0)
@@ -83,28 +83,58 @@ def ExtremaSearch(DoGs, s, contrast_threshold = 0.03):
         keep[:, -1:, :] = False
         keep[:, :, :1] = False
         keep[:, :, -1:] = False
-        print(keep.shape)
-
+        
+        operable_scale_space = img_t.squeeze(0).squeeze(0)
         nonz = keep.nonzero(as_tuple = True)
-        s_idx, y, xc = nonz
+        s_i, y_i, x_i = nonz[0].clone(), nonz[1].clone(), nonz[2].clone()
+        S, H, W = operable_scale_space.shape
+        #mark keypoints to drop by position, resolved once after the loop
+        remove = torch.zeros(len(s_i), dtype = torch.bool)
         # loop over non zero indeces to quadratic fit and check maxima
-        for i in range(len(s_idx)):
-            s = s_idx[i].item()
-            y = y[i].item()
-            x = xc[i].item()
-            hessian = build_hessian(x, s, y, x)
-            grad = get_grad(x,s, y, x)
-            delta = torch.linaglg.solve(hessian, -grad)
-            
+        for i in range(len(s_i)):
+            s = s_i[i].item()
+            y = y_i[i].item()
+            x = x_i[i].item()
+            converged = False
+            for j in range(5):
+                hessian = build_hessian(operable_scale_space, s, y, x)
+                grad = get_grad(operable_scale_space,s, y, x)
+                delta = torch.linalg.solve(hessian, -grad)
+                check = torch.round(delta).to(torch.int32)
+                if (check == 0).all():
+                    #offset < 0.5 in every axis -> converged, stop
+                    converged = True
+                    break
+                #not converged: move to the nearest integer sample and re-solve
+                ds, dy, dx = tuple(check.tolist())
+                s += ds
+                y += dy
+                x += dx
+                #re-centering can walk back into the border where the finite
+                #differences would read out of bounds - bail if so
+                if not (1 <= s < S - 1 and 1 <= y < H - 1 and 1 <= x < W - 1):
+                    break
+            if converged:
+                s_i[i] = s
+                y_i[i] = y
+                x_i[i] = x
+            else:
+                #never settled (or walked off the volume) - not a stable keypoint
+                remove[i] = True
+        #remove bad indeces all at once, by position, to avoid corruption
+        s_i = s_i[~remove]
+        y_i = y_i[~remove]
+        x_i = x_i[~remove]
+
 
 
         
         #DoG j is blur[j + 1] - blur[j], so it takes the scale of the lower
         #blur: SIGMA * k^j. The 2^octave_idx factor undoes the subsampling so
         #sigma comes out in original-image pixels.
-        sigma = SIGMA * (2.0 ** (s_idx.float() / s)) * (2.0 ** octave_idx)
-
-        extrema.append(torch.stack([s_idx.float(), y.float(), xc.float(), sigma], dim = 1))
+        sigma = SIGMA * (2.0 ** (s_i.float() / sig)) * (2.0 ** octave_idx)
+        print(len(s_i), len(y_i), len(x_i))
+        extrema.append(torch.stack([s_i.float(), y_i.float(), x_i.float(), sigma], dim = 1))
     return extrema
 #s, y, x is the center
 #p is the matrix to do finite differences on
@@ -112,13 +142,13 @@ def build_hessian(p, s, y, x):
     Dss = -2 * p[s, y, x] + p[s+1,y,x] + p[s-1,y,x]
     Dxx = -2 * p[s, y, x] + p[s,y,x+1] + p[s,y,x-1]
     Dyy = -2 * p[s, y, x] + p[s,y+1,x] + p[s,y-1,x]
-    Dsx = (p[s+1,y,x+1] - p[s-1,y,x+1]) - (p[s+1,y,x-1]-  p[s-1,y,x-1])
-    Dsy = (p[s+1,y+1,x] - p[s-1,y+1,x]) - (p[s+1,y-1,x]-  p[s-1,y-1,x])
-    Dxy = (p[s,y+1,x+1] - p[s,y+1,x-1]) - (p[s,y-1,x+1]-  p[s,y-1,x-1])
-    return torch.tensor[[Dss, Dsy, Dsx], [Dsy, Dyy, Dxy], [Dsx, Dxy, Dxx]]
+    Dsx = ((p[s+1,y,x+1] - p[s-1,y,x+1]) - (p[s+1,y,x-1]-  p[s-1,y,x-1])) / 4
+    Dsy = ((p[s+1,y+1,x] - p[s-1,y+1,x]) - (p[s+1,y-1,x]-  p[s-1,y-1,x])) / 4
+    Dxy = ((p[s,y+1,x+1] - p[s,y+1,x-1]) - (p[s,y-1,x+1]-  p[s,y-1,x-1])) / 4
+    return torch.tensor([[Dss, Dsy, Dsx], [Dsy, Dyy, Dxy], [Dsx, Dxy, Dxx]])
 def get_grad(p,s,y,x):
-    Dx = p[s,y,x+1] - p[s,y,x-1]
-    Dy = p[s,y+1,x] - p[s,y-1,x]
-    Ds = p[s+1,y,x] - p[s-1,y,x]
+    Dx = (p[s,y,x+1] - p[s,y,x-1]) / 2
+    Dy = (p[s,y+1,x] - p[s,y-1,x]) / 2
+    Ds = (p[s+1,y,x] - p[s-1,y,x]) / 2
     return torch.tensor([Ds,Dy,Dx])
     
