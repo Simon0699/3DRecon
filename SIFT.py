@@ -121,6 +121,14 @@ def ExtremaSearch(DoGs, sig, contrast_threshold = 0.03):
             else:
                 #never settled (or walked off the volume) - not a stable keypoint
                 remove[i] = True
+            #2D hessian for spatial curvature (in x and y only)
+            d2_hessian = hessian[1:3,1:3]
+            #g(r) = r + 1/r + 2 = trace^2/det where r = l1/l2 (eigenvalue 1 / eigenvalue 2)
+            #makes sure that eigenvalues are not imbalanced -> actual blob / curve not straight edge
+            g = (d2_hessian.trace()**2)/(d2_hessian.det())
+            #g(10) = 10 + 0.1 + 2 = 12.1 so if ratio more than 10 or less than 0.1 (depending on the way you order the eigenvalues)
+            if (g > 12.1): remove[i] = True
+
         #remove bad indeces all at once, by position, to avoid corruption
         s_i = s_i[~remove]
         y_i = y_i[~remove]
@@ -133,7 +141,6 @@ def ExtremaSearch(DoGs, sig, contrast_threshold = 0.03):
         #blur: SIGMA * k^j. The 2^octave_idx factor undoes the subsampling so
         #sigma comes out in original-image pixels.
         sigma = SIGMA * (2.0 ** (s_i.float() / sig)) * (2.0 ** octave_idx)
-        print(len(s_i), len(y_i), len(x_i))
         extrema.append(torch.stack([s_i.float(), y_i.float(), x_i.float(), sigma], dim = 1))
     return extrema
 #s, y, x is the center
