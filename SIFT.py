@@ -83,9 +83,22 @@ def ExtremaSearch(DoGs, s, contrast_threshold = 0.03):
         keep[:, -1:, :] = False
         keep[:, :, :1] = False
         keep[:, :, -1:] = False
+        print(keep.shape)
 
-        s_idx, y, xc = keep.nonzero(as_tuple = True)
+        nonz = keep.nonzero(as_tuple = True)
+        s_idx, y, xc = nonz
+        # loop over non zero indeces to quadratic fit and check maxima
+        for i in range(len(s_idx)):
+            s = s_idx[i].item()
+            y = y[i].item()
+            x = xc[i].item()
+            hessian = build_hessian(x, s, y, x)
+            grad = get_grad(x,s, y, x)
+            delta = torch.linaglg.solve(hessian, -grad)
+            
 
+
+        
         #DoG j is blur[j + 1] - blur[j], so it takes the scale of the lower
         #blur: SIGMA * k^j. The 2^octave_idx factor undoes the subsampling so
         #sigma comes out in original-image pixels.
@@ -93,4 +106,19 @@ def ExtremaSearch(DoGs, s, contrast_threshold = 0.03):
 
         extrema.append(torch.stack([s_idx.float(), y.float(), xc.float(), sigma], dim = 1))
     return extrema
-
+#s, y, x is the center
+#p is the matrix to do finite differences on
+def build_hessian(p, s, y, x):
+    Dss = -2 * p[s, y, x] + p[s+1,y,x] + p[s-1,y,x]
+    Dxx = -2 * p[s, y, x] + p[s,y,x+1] + p[s,y,x-1]
+    Dyy = -2 * p[s, y, x] + p[s,y+1,x] + p[s,y-1,x]
+    Dsx = (p[s+1,y,x+1] - p[s-1,y,x+1]) - (p[s+1,y,x-1]-  p[s-1,y,x-1])
+    Dsy = (p[s+1,y+1,x] - p[s-1,y+1,x]) - (p[s+1,y-1,x]-  p[s-1,y-1,x])
+    Dxy = (p[s,y+1,x+1] - p[s,y+1,x-1]) - (p[s,y-1,x+1]-  p[s,y-1,x-1])
+    return torch.tensor[[Dss, Dsy, Dsx], [Dsy, Dyy, Dxy], [Dsx, Dxy, Dxx]]
+def get_grad(p,s,y,x):
+    Dx = p[s,y,x+1] - p[s,y,x-1]
+    Dy = p[s,y+1,x] - p[s,y-1,x]
+    Ds = p[s+1,y,x] - p[s-1,y,x]
+    return torch.tensor([Ds,Dy,Dx])
+    
