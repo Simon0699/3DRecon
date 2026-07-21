@@ -169,7 +169,45 @@ def get_grad(p,s,y,x):
     return torch.tensor([Ds,Dy,Dx])
 #takes in which octave along with the feature location x = (s,y,x,sigma)
 #oct = whole octave that produced its respective DoG which the feature came from
-def feature_description(oct, feature):
+def bilinear_interpolate(x, y, layer):
+    H, W = layer.shape
+    #the four surrounding integer pixels, clamped so rotated samples near the
+    #image border never index out of bounds
+    x0 = int(math.floor(float(x))); y0 = int(math.floor(float(y)))
+    x1 = x0 + 1; y1 = y0 + 1
+    fx = float(x) - x0
+    fy = float(y) - y0
+    x0 = min(max(x0, 0), W - 1); x1 = min(max(x1, 0), W - 1)
+    y0 = min(max(y0, 0), H - 1); y1 = min(max(y1, 0), H - 1)
+    tl = (1 - fx) * (1 - fy)
+    tr = fx * (1 - fy)
+    bl = (1 - fx) * fy
+    br = fx * fy
+    return (tl * layer[y0, x0] + tr * layer[y0, x1]
+            + bl * layer[y1, x0] + br * layer[y1, x1])
+def parabolic_interpolation(indices, bin36):
+    doma = []
+    for i in indices:
+        if (i == 0):
+            n1 = 35
+            n2 = 1
+        elif  (i == 35):
+            n1 = 34
+            n2 = 0
+        else:
+            n1 = i - 1
+            n2 = i + 1
+        v1 = bin36[n1]
+        v2 = bin36[i]
+        v3 = bin36[n2]
+        a = (v1 + v3)/2 - v2
+        b = (v3 - v1)/2
+        #a == 0 means a flat (non-curved) peak - no sub-bin nudge
+        xb = -b/(2*a) if a != 0 else 0.0
+        doma.append(10 * (int(i) + float(xb)))
+    return doma
+
+def feature_description(oct, feature, descs):
     s_total = oct.shape[0] - 3
     s_f = int(round(feature[0].item())) # which s index did it come from 1 - 6
     y_f = int(feature[1].item())
@@ -192,7 +230,103 @@ def feature_description(oct, feature):
             theta = theta % 360
             m = torch.sqrt(Gx**2 + Gy**2)
             bin36[int(torch.floor(theta/10).item())] += m * math.exp(-l22/(2*sigma**2))
+    top2 = torch.topk(bin36, 2)
+    values = top2.values
+    indices = top2.indices
+    #keep the 2nd orientation only if it is a strong (>=80%) secondary peak
+    if (values[1] < 0.8 * values[0]):
+        indices = indices[:1]
+    dom_angles = parabolic_interpolation(indices, bin36)  # degrees
+
+    #descriptor window is MUCH larger than the orientation radius above:
+    #4 cells of ~3*sigma each, plus a sqrt(2) margin for rotation -> ~8.5*sigma.
+    #(radius = 1.5*sigma from earlier is only for the orientation histogram.)
+    cell_size = 3 * sigma
+    desc_radius = int(round(cell_size * 4 * (2 ** 0.5) / 2))
+    #weighting Gaussian spans the whole window (sigma_w ~= half its width), so the
+    #outer cells still receive meaningful weight instead of decaying to ~0.
+    sigma_w = desc_radius / 2.0
+    two_sig2_w = 2 * sigma_w ** 2
+
+    #sampling grid: offsets relative to the keypoint, spanning the 4x4 cell window
+    xcoords = torch.arange(-desc_radius, desc_radius + 1, 1, dtype = torch.float32)
+    ycoords = torch.arange(-desc_radius, desc_radius + 1, 1, dtype = torch.float32)
+    frame = torch.cartesian_prod(xcoords, ycoords)  # col0 = x-offset, col1 = y-offset
+    cell_w = (2 * desc_radius) / 4.0                 # width of one of the 4 cells per axis
+
+    #descs is the caller's list - append into it directly (do NOT rebind it here,
+    #or the appends would land in a local list that is discarded on return)
+    #at most 1 or 2 dominant angles - this is not a real triple loop
+    for ang_deg in dom_angles:
+        ang = ang_deg * math.pi / 180.0             # rotation matrix needs radians
+        cos_a = math.cos(ang); sin_a = math.sin(ang)
+        rot = torch.tensor([[cos_a, -sin_a], [sin_a, cos_a]], dtype = torch.float32)
+        offsets = torch.matmul(frame, rot)          # rotated offsets: col0 = u(x), col1 = v(y)
+        description = torch.zeros(16, 8)
+        for j in range(len(offsets)):
+            u = float(offsets[j, 0])                # rotated x-offset from keypoint
+            v = float(offsets[j, 1])                # rotated y-offset from keypoint
+            #which of the 4x4 cells this sample lands in (from its POSITION, not loop order)
+            cx = int((u + desc_radius) // cell_w)
+            cy = int((v + desc_radius) // cell_w)
+            cx = min(max(cx, 0), 3)
+            cy = min(max(cy, 0), 3)
+            cell = cy * 4 + cx
+            #translate to absolute image coords only for sampling the gradient
+            sx = u + x_f
+            sy = v + y_f
+            Gx = bilinear_interpolate(sx + 1, sy, layer) - bilinear_interpolate(sx - 1, sy, layer)
+            Gy = bilinear_interpolate(sx, sy + 1, layer) - bilinear_interpolate(sx, sy - 1, layer)
+            #angle relative to the dominant orientation
+            angle = (torch.atan2(Gy, Gx) * 180/torch.pi - ang_deg) % 360
+            bini = int(torch.floor(angle/45).item())
+            m = (Gx**2 + Gy**2)**0.5
+            l22 = u**2 + v**2                        # distance to keypoint (rotation-invariant)
+            description[cell][bini] += m * math.exp(-l22 / two_sig2_w)
+        description = description.flatten()
+        #+1e-7 guards a fully flat window (no gradients) from 0/0 -> nan
+        description /= (description.norm() + 1e-7)
+        description = torch.clamp(description,max = 0.2)
+        description /= (description.norm() + 1e-7)
+        descs.append(description)
+#Full SIFT with image tensor. Returns:
+#  descriptors: (N, 128) unit-normalized
+#  positions:   (N, 2) as (y, x) in ORIGINAL full-resolution image pixels
+#N is the number of descriptors, which may exceed the number of keypoints because
+#a keypoint with two dominant orientations yields two descriptors.
+NUM_OCTAVES = 4
+def SIFT(image):
+    full_H, full_W = image.shape[-2], image.shape[-1]
+    descs = []
+    positions = []
+    oct = create_octaves(image, 6, NUM_OCTAVES)
+    dog = GetDoG(oct)
+    extrema = ExtremaSearch(dog, 6, 0.03)
+    for i in range(len(extrema)):
+        #octave i is downsampled from the original; use the MEASURED ratio per axis
+        #(not 2**i) so odd-sized halvings that floor-round are scaled exactly.
+        _, _, oh, ow = oct[i].shape
+        sy = full_H / oh
+        sx = full_W / ow
+        for j in range(len(extrema[i])):
+            feat = extrema[i][j]
+            before = len(descs)
+            feature_description(oct[i], feat, descs)
+            #one position per descriptor actually produced (1 or 2), kept aligned
+            y_full = feat[1].item() * sy
+            x_full = feat[2].item() * sx
+            for _ in range(len(descs) - before):
+                positions.append([y_full, x_full])
+
+    if not descs:
+        return torch.empty(0, 128), torch.empty(0, 2)
+    return torch.stack(descs), torch.tensor(positions)
+
+
+
+
     
+
     
 
 
