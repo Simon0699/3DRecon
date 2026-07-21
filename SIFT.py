@@ -192,7 +192,7 @@ def feature_description(oct, feature):
             theta = theta % 360
             m = torch.sqrt(Gx**2 + Gy**2)
             bin36[int(torch.floor(theta/10).item())] += m * math.exp(-l22/(2*sigma**2))
-
+    
     
 
 
