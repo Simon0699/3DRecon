@@ -258,37 +258,76 @@ def feature_description(oct, feature, descs):
     #or the appends would land in a local list that is discarded on return)
     #at most 1 or 2 dominant angles - this is not a real triple loop
     for ang_deg in dom_angles:
-        ang = ang_deg * math.pi / 180.0             # rotation matrix needs radians
-        cos_a = math.cos(ang); sin_a = math.sin(ang)
-        rot = torch.tensor([[cos_a, -sin_a], [sin_a, cos_a]], dtype = torch.float32)
-        offsets = torch.matmul(frame, rot)          # rotated offsets: col0 = u(x), col1 = v(y)
-        description = torch.zeros(16, 8)
-        for j in range(len(offsets)):
-            u = float(offsets[j, 0])                # rotated x-offset from keypoint
-            v = float(offsets[j, 1])                # rotated y-offset from keypoint
-            #which of the 4x4 cells this sample lands in (from its POSITION, not loop order)
-            cx = int((u + desc_radius) // cell_w)
-            cy = int((v + desc_radius) // cell_w)
-            cx = min(max(cx, 0), 3)
-            cy = min(max(cy, 0), 3)
-            cell = cy * 4 + cx
-            #translate to absolute image coords only for sampling the gradient
-            sx = u + x_f
-            sy = v + y_f
-            Gx = bilinear_interpolate(sx + 1, sy, layer) - bilinear_interpolate(sx - 1, sy, layer)
-            Gy = bilinear_interpolate(sx, sy + 1, layer) - bilinear_interpolate(sx, sy - 1, layer)
-            #angle relative to the dominant orientation
-            angle = (torch.atan2(Gy, Gx) * 180/torch.pi - ang_deg) % 360
-            bini = int(torch.floor(angle/45).item())
-            m = (Gx**2 + Gy**2)**0.5
-            l22 = u**2 + v**2                        # distance to keypoint (rotation-invariant)
-            description[cell][bini] += m * math.exp(-l22 / two_sig2_w)
-        description = description.flatten()
-        #+1e-7 guards a fully flat window (no gradients) from 0/0 -> nan
-        description /= (description.norm() + 1e-7)
-        description = torch.clamp(description,max = 0.2)
-        description /= (description.norm() + 1e-7)
+        description = build_descriptor_vec(
+            layer, frame, x_f, y_f, ang_deg, desc_radius, cell_w, two_sig2_w)
         descs.append(description)
+
+
+#Vectorized descriptor: instead of looping over the ~1600 sample points one at a
+#time, every step below runs ONCE over all points at once as tensor ops. Same
+#math as the old scalar loop, just batched. Returns a normalized (128,) vector.
+def build_descriptor_vec(layer, frame, x_f, y_f, ang_deg, desc_radius, cell_w, two_sig2_w):
+    H, W = layer.shape
+    ang = ang_deg * math.pi / 180.0
+    cos_a = math.cos(ang); sin_a = math.sin(ang)
+    rot = torch.tensor([[cos_a, -sin_a], [sin_a, cos_a]], dtype = torch.float32)
+
+    offsets = torch.matmul(frame, rot)   # (P,2): rotated offsets, col0=u(x), col1=v(y)
+    u = offsets[:, 0]                     # (P,) all x-offsets at once
+    v = offsets[:, 1]                     # (P,) all y-offsets at once
+
+    #--- which 4x4 cell each point lands in (all P points at once) ---
+    cx = torch.clamp(((u + desc_radius) // cell_w).long(), 0, 3)   # (P,)
+    cy = torch.clamp(((v + desc_radius) // cell_w).long(), 0, 3)   # (P,)
+    cell = cy * 4 + cx                                             # (P,) values 0..15
+
+    #--- absolute sample coords, then the 4 gradient-neighbour coords, all batched ---
+    sx = u + x_f
+    sy = v + y_f
+    #Gx needs L(sx+1,sy) and L(sx-1,sy); Gy needs L(sx,sy+1) and L(sx,sy-1)
+    gx_r = bilinear_interp_batch(sx + 1, sy, layer, H, W)
+    gx_l = bilinear_interp_batch(sx - 1, sy, layer, H, W)
+    gy_u = bilinear_interp_batch(sx, sy + 1, layer, H, W)
+    gy_d = bilinear_interp_batch(sx, sy - 1, layer, H, W)
+    Gx = gx_r - gx_l                      # (P,)
+    Gy = gy_u - gy_d                      # (P,)
+
+    #--- magnitude, angle, gaussian weight: one call each over the whole batch ---
+    m = torch.sqrt(Gx * Gx + Gy * Gy)                              # (P,)
+    angle = (torch.atan2(Gy, Gx) * 180 / math.pi - ang_deg) % 360  # (P,)
+    bini = torch.clamp(torch.floor(angle / 45).long(), 0, 7)       # (P,) values 0..7
+    l22 = u * u + v * v                                            # (P,)
+    weight = m * torch.exp(-l22 / two_sig2_w)                      # (P,) the vote each point casts
+
+    #--- the histogram accumulate: every point adds `weight` to slot (cell, bini).
+    #Flatten the 16x8 grid to 128 and turn each point's (cell,bini) into a single
+    #flat index, then scatter-add all P votes in one shot (replaces the += loop). ---
+    flat_idx = cell * 8 + bini                                     # (P,) values 0..127
+    description = torch.zeros(128)
+    description.index_add_(0, flat_idx, weight)                    # add all votes at once
+
+    #+1e-7 guards a fully flat window (no gradients) from 0/0 -> nan
+    description /= (description.norm() + 1e-7)
+    description = torch.clamp(description, max = 0.2)
+    description /= (description.norm() + 1e-7)
+    return description
+
+
+#Batched bilinear interpolation: sample layer at P fractional (x,y) points at once.
+#Same 4-corner blend as bilinear_interpolate, but every op is over (P,) tensors.
+def bilinear_interp_batch(x, y, layer, H, W):
+    x0 = torch.floor(x).long(); y0 = torch.floor(y).long()
+    x1 = x0 + 1; y1 = y0 + 1
+    fx = x - x0.float()                    # (P,) fractional parts
+    fy = y - y0.float()
+    #clamp the corner indices so points near the border never read out of bounds
+    x0 = x0.clamp(0, W - 1); x1 = x1.clamp(0, W - 1)
+    y0 = y0.clamp(0, H - 1); y1 = y1.clamp(0, H - 1)
+    #gather the four surrounding pixels for ALL points at once
+    tl = layer[y0, x0]; tr = layer[y0, x1]
+    bl = layer[y1, x0]; br = layer[y1, x1]
+    return (tl * (1 - fx) * (1 - fy) + tr * fx * (1 - fy)
+            + bl * (1 - fx) * fy + br * fx * fy)
 #Full SIFT with image tensor. Returns:
 #  descriptors: (N, 128) unit-normalized
 #  positions:   (N, 2) as (y, x) in ORIGINAL full-resolution image pixels
