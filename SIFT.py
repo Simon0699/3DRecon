@@ -1,5 +1,6 @@
-import torch 
-import cv2 
+import torch
+import math
+import cv2
 from PIL import Image
 from torchvision import transforms
 image_to_tensor = transforms.ToTensor()
@@ -36,7 +37,15 @@ def octave(x, s):
 
 
 #o = # of octaves
+#CAMERA_SIGMA = blur already baked into the raw image by the lens/sensor/sampling
+CAMERA_SIGMA = 0.5
 def create_octaves(x, s, o):
+    #the raw image is not unblurred - it already sits at ~CAMERA_SIGMA. Bring it
+    #up to the base SIGMA once (quadrature), so octave 0 level 0 is a true SIGMA.
+    #octaves 1+ start from a subsampled slice already at SIGMA, so they must NOT
+    #be bootstrapped again - that is why this lives here, not inside octave().
+    sigma_bootstrap = (SIGMA ** 2 - CAMERA_SIGMA ** 2) ** 0.5
+    x = blur(x, sigma_bootstrap)
     octaves = []
     for i in range(o):
         oct = octave(x, s)
@@ -158,4 +167,34 @@ def get_grad(p,s,y,x):
     Dy = (p[s,y+1,x] - p[s,y-1,x]) / 2
     Ds = (p[s+1,y,x] - p[s-1,y,x]) / 2
     return torch.tensor([Ds,Dy,Dx])
+#takes in which octave along with the feature location x = (s,y,x,sigma)
+#oct = whole octave that produced its respective DoG which the feature came from
+def feature_description(oct, feature):
+    s_total = oct.shape[0] - 3
+    s_f = int(round(feature[0].item())) # which s index did it come from 1 - 6
+    y_f = int(feature[1].item())
+    x_f = int(feature[2].item())
+    sigma = 1.6 * (2 ** (s_f/s_total))
+    radius = int(round(1.5 * sigma))
+    bin36 = torch.zeros(36) # 36 bins for each 10 bin degree | 10 * 36 = 360
+    layer = oct[s_f] # shape either [1,y,x] or [y,x]
+    layer = layer.squeeze(0) # squeeze does not affect if dim 0 is already > 1 (what we want)\
+    for i in range(-radius, radius + 1, 1):
+        for j in range(-radius, radius + 1, 1):
+            x = x_f + i
+            y = y_f + j
+            if not (1 <= y < layer.shape[0]-1 and 1 <= x < layer.shape[1]-1):
+                continue
+            l22 = (i**2 + j**2)
+            Gx = layer[y,x + 1] - layer[y,x - 1]
+            Gy = layer[y + 1, x] - layer[y - 1, x]
+            theta = torch.atan2(Gy, Gx) * 180/torch.pi 
+            theta = theta % 360
+            m = torch.sqrt(Gx**2 + Gy**2)
+            bin36[int(torch.floor(theta/10).item())] += m * math.exp(-l22/(2*sigma**2))
+
+    
+
+
+
     
